@@ -8,18 +8,20 @@
 #include "ImGui/FullscreenUI.h"
 #include "ImGui/ImGuiOverlays.h"
 #include "Input/InputManager.h"
+#include "Patch.h"
 #include "Recording/InputRecording.h"
 #include "SPU2/spu2.h"
 #include "VMManager.h"
-#include "INISettingsInterface.h"
-#include "Patch.h"
 #include "SIO/Memcard/MemoryCardFile.h"
 
 #include "common/Assertions.h"
 #include "common/Error.h"
 #include "common/FileSystem.h"
 #include "common/Path.h"
+#include "common/SettingsInterface.h"
 #include "common/Timer.h"
+
+#include <algorithm>
 
 static std::optional<LimiterModeType> s_limiter_mode_prior_to_hold_interaction;
 
@@ -116,6 +118,83 @@ static void HotkeySaveStateSlot(s32 slot)
 {
 	VMManager::SaveStateToSlot(slot, true, [slot](const std::string& error) {
 		FullscreenUI::ReportStateSaveError(error, slot);
+	});
+}
+
+// The game settings layer is not thread-safe. Hold the settings lock only while accessing,
+// modifying, and saving it, then release the lock before reloading patches because the reload
+// path may access settings internally.
+static void HotkeyToggleCheatSlot(u32 slot)
+{
+	if (!VMManager::HasValidVM())
+		return;
+
+	Host::RunOnCPUThread([slot]() {
+		if (!VMManager::HasValidVM())
+			return;
+
+		const std::string setting_key = fmt::format("CheatToggleSlot{}", slot);
+		const std::string osd_key = fmt::format("CheatSlot{}", slot);
+		const std::string cheat_name = Host::GetStringSettingValue("CheatHotkeys", setting_key.c_str(), "");
+
+		if (cheat_name.empty())
+		{
+			Host::AddKeyedOSDMessage(osd_key,
+				fmt::format(TRANSLATE_FS("Hotkeys", "Cheat Slot {0}: not configured"), slot),
+				Host::OSD_INFO_DURATION);
+			return;
+		}
+
+		bool game_settings_available = false;
+		bool cheat_enabled = false;
+		bool settings_saved = false;
+
+		{
+			auto lock = Host::GetSettingsLock();
+			SettingsInterface* const si = Host::Internal::GetGameSettingsLayer();
+			if (si)
+			{
+				game_settings_available = true;
+
+				const std::vector<std::string> enabled_cheats =
+					si->GetStringList(Patch::CHEATS_CONFIG_SECTION, Patch::PATCH_ENABLE_CONFIG_KEY);
+				const auto it = std::find(enabled_cheats.begin(), enabled_cheats.end(), cheat_name);
+
+				if (it != enabled_cheats.end())
+					si->RemoveFromStringList(Patch::CHEATS_CONFIG_SECTION, Patch::PATCH_ENABLE_CONFIG_KEY, cheat_name.c_str());
+				else
+					si->AddToStringList(Patch::CHEATS_CONFIG_SECTION, Patch::PATCH_ENABLE_CONFIG_KEY, cheat_name.c_str());
+
+				cheat_enabled = (it == enabled_cheats.end());
+				settings_saved = si->Save();
+			}
+		}
+
+		if (!game_settings_available)
+		{
+			Host::AddIconOSDMessage(osd_key, ICON_FA_TRIANGLE_EXCLAMATION,
+				fmt::format(TRANSLATE_FS("Hotkeys", "Cheat Slot {0}: no per-game settings available."), slot),
+				Host::OSD_INFO_DURATION);
+			return;
+		}
+
+		const std::string_view state =
+			cheat_enabled ? TRANSLATE_SV("Hotkeys", "ON") : TRANSLATE_SV("Hotkeys", "OFF");
+
+		if (!settings_saved)
+		{
+			Host::AddIconOSDMessage(osd_key, ICON_FA_TRIANGLE_EXCLAMATION,
+				fmt::format(TRANSLATE_FS("Hotkeys", "Cheat Slot {0} ({1}): {2} (failed to save settings)"),
+					slot, cheat_name, state),
+				Host::OSD_ERROR_DURATION);
+		}
+		else
+		{
+			Host::AddKeyedOSDMessage(osd_key,
+				fmt::format(TRANSLATE_FS("Hotkeys", "Cheat Slot {0} ({1}): {2}"), slot, cheat_name, state));
+		}
+
+		VMManager::ReloadPatches(false, true, false, false);
 	});
 }
 
@@ -248,7 +327,7 @@ DEFINE_HOTKEY("ReloadPatches", TRANSLATE_NOOP("Hotkeys", "System"), TRANSLATE_NO
 		{
 			Host::RunOnCPUThread([]() {
 				Host::AddKeyedOSDMessage("ReloadPatchHotkey", "Reloading Patches...");
-				VMManager::ReloadPatches(true, true, true, true);
+				VMManager::ReloadPatches(true, false, true, true);
 			});
 		}
 	})
@@ -357,454 +436,20 @@ DEFINE_HOTKEY("ToggleMouseLock", TRANSLATE_NOOP("Hotkeys", "System"), TRANSLATE_
 		if (!pressed)
 			Host::SetMouseLock(!Host::GetBoolSettingValue("EmuCore", "EnableMouseLock"));
 	})
-
-
-DEFINE_HOTKEY("ToggleCheatSlot1", TRANSLATE_NOOP("Hotkeys", "System"), TRANSLATE_NOOP("Hotkeys", "Toggle Cheat Slot 1"), [](s32 pressed) {
-        if (!pressed && VMManager::HasValidVM())
-        {
-                Host::RunOnCPUThread([]() {
-                        SettingsInterface* si = Host::Internal::GetGameSettingsLayer();
-                        if (!si)
-                                return;
-                        const std::string cheat_name = Host::GetStringSettingValue("CheatHotkeys", "CheatToggleSlot1", "");
-                        if (cheat_name.empty())
-                                return;
-                        std::vector<std::string> enabled = si->GetStringList(Patch::CHEATS_CONFIG_SECTION, Patch::PATCH_ENABLE_CONFIG_KEY);
-                        auto it = std::find(enabled.begin(), enabled.end(), cheat_name);
-                        if (it != enabled.end())
-                        {
-                                si->RemoveFromStringList(Patch::CHEATS_CONFIG_SECTION, Patch::PATCH_ENABLE_CONFIG_KEY, cheat_name.c_str());
-                                Host::AddKeyedOSDMessage("CheatSlot1", fmt::format("Cheat Slot 1 ({}): OFF", cheat_name));
-                        }
-                        else
-                        {
-                                si->AddToStringList(Patch::CHEATS_CONFIG_SECTION, Patch::PATCH_ENABLE_CONFIG_KEY, cheat_name.c_str());
-                                Host::AddKeyedOSDMessage("CheatSlot1", fmt::format("Cheat Slot 1 ({}): ON", cheat_name));
-                        }
-                        si->Save();
-                        VMManager::ReloadPatches(true, true, true, true);
-                });
-        }
-})
-
-DEFINE_HOTKEY("ToggleCheatSlot2", TRANSLATE_NOOP("Hotkeys", "System"), TRANSLATE_NOOP("Hotkeys", "Toggle Cheat Slot 2"), [](s32 pressed) {
-        if (!pressed && VMManager::HasValidVM())
-        {
-                Host::RunOnCPUThread([]() {
-                        SettingsInterface* si = Host::Internal::GetGameSettingsLayer();
-                        if (!si)
-                                return;
-                        const std::string cheat_name = Host::GetStringSettingValue("CheatHotkeys", "CheatToggleSlot2", "");
-                        if (cheat_name.empty())
-                                return;
-                        std::vector<std::string> enabled = si->GetStringList(Patch::CHEATS_CONFIG_SECTION, Patch::PATCH_ENABLE_CONFIG_KEY);
-                        auto it = std::find(enabled.begin(), enabled.end(), cheat_name);
-                        if (it != enabled.end())
-                        {
-                                si->RemoveFromStringList(Patch::CHEATS_CONFIG_SECTION, Patch::PATCH_ENABLE_CONFIG_KEY, cheat_name.c_str());
-                                Host::AddKeyedOSDMessage("CheatSlot2", fmt::format("Cheat Slot 2 ({}): OFF", cheat_name));
-                        }
-                        else
-                        {
-                                si->AddToStringList(Patch::CHEATS_CONFIG_SECTION, Patch::PATCH_ENABLE_CONFIG_KEY, cheat_name.c_str());
-                                Host::AddKeyedOSDMessage("CheatSlot2", fmt::format("Cheat Slot 2 ({}): ON", cheat_name));
-                        }
-                        si->Save();
-                        VMManager::ReloadPatches(true, true, true, true);
-                });
-        }
-})
-
-DEFINE_HOTKEY("ToggleCheatSlot3", TRANSLATE_NOOP("Hotkeys", "System"), TRANSLATE_NOOP("Hotkeys", "Toggle Cheat Slot 3"), [](s32 pressed) {
-        if (!pressed && VMManager::HasValidVM())
-        {
-                Host::RunOnCPUThread([]() {
-                        SettingsInterface* si = Host::Internal::GetGameSettingsLayer();
-                        if (!si)
-                                return;
-                        const std::string cheat_name = Host::GetStringSettingValue("CheatHotkeys", "CheatToggleSlot3", "");
-                        if (cheat_name.empty())
-                                return;
-                        std::vector<std::string> enabled = si->GetStringList(Patch::CHEATS_CONFIG_SECTION, Patch::PATCH_ENABLE_CONFIG_KEY);
-                        auto it = std::find(enabled.begin(), enabled.end(), cheat_name);
-                        if (it != enabled.end())
-                        {
-                                si->RemoveFromStringList(Patch::CHEATS_CONFIG_SECTION, Patch::PATCH_ENABLE_CONFIG_KEY, cheat_name.c_str());
-                                Host::AddKeyedOSDMessage("CheatSlot3", fmt::format("Cheat Slot 3 ({}): OFF", cheat_name));
-                        }
-                        else
-                        {
-                                si->AddToStringList(Patch::CHEATS_CONFIG_SECTION, Patch::PATCH_ENABLE_CONFIG_KEY, cheat_name.c_str());
-                                Host::AddKeyedOSDMessage("CheatSlot3", fmt::format("Cheat Slot 3 ({}): ON", cheat_name));
-                        }
-                        si->Save();
-                        VMManager::ReloadPatches(true, true, true, true);
-                });
-        }
-})
-
-DEFINE_HOTKEY("ToggleCheatSlot4", TRANSLATE_NOOP("Hotkeys", "System"), TRANSLATE_NOOP("Hotkeys", "Toggle Cheat Slot 4"), [](s32 pressed) {
-        if (!pressed && VMManager::HasValidVM())
-        {
-                Host::RunOnCPUThread([]() {
-                        SettingsInterface* si = Host::Internal::GetGameSettingsLayer();
-                        if (!si)
-                                return;
-                        const std::string cheat_name = Host::GetStringSettingValue("CheatHotkeys", "CheatToggleSlot4", "");
-                        if (cheat_name.empty())
-                                return;
-                        std::vector<std::string> enabled = si->GetStringList(Patch::CHEATS_CONFIG_SECTION, Patch::PATCH_ENABLE_CONFIG_KEY);
-                        auto it = std::find(enabled.begin(), enabled.end(), cheat_name);
-                        if (it != enabled.end())
-                        {
-                                si->RemoveFromStringList(Patch::CHEATS_CONFIG_SECTION, Patch::PATCH_ENABLE_CONFIG_KEY, cheat_name.c_str());
-                                Host::AddKeyedOSDMessage("CheatSlot4", fmt::format("Cheat Slot 4 ({}): OFF", cheat_name));
-                        }
-                        else
-                        {
-                                si->AddToStringList(Patch::CHEATS_CONFIG_SECTION, Patch::PATCH_ENABLE_CONFIG_KEY, cheat_name.c_str());
-                                Host::AddKeyedOSDMessage("CheatSlot4", fmt::format("Cheat Slot 4 ({}): ON", cheat_name));
-                        }
-                        si->Save();
-                        VMManager::ReloadPatches(true, true, true, true);
-                });
-        }
-})
-
-DEFINE_HOTKEY("ToggleCheatSlot5", TRANSLATE_NOOP("Hotkeys", "System"), TRANSLATE_NOOP("Hotkeys", "Toggle Cheat Slot 5"), [](s32 pressed) {
-        if (!pressed && VMManager::HasValidVM())
-        {
-                Host::RunOnCPUThread([]() {
-                        SettingsInterface* si = Host::Internal::GetGameSettingsLayer();
-                        if (!si)
-                                return;
-                        const std::string cheat_name = Host::GetStringSettingValue("CheatHotkeys", "CheatToggleSlot5", "");
-                        if (cheat_name.empty())
-                                return;
-                        std::vector<std::string> enabled = si->GetStringList(Patch::CHEATS_CONFIG_SECTION, Patch::PATCH_ENABLE_CONFIG_KEY);
-                        auto it = std::find(enabled.begin(), enabled.end(), cheat_name);
-                        if (it != enabled.end())
-                        {
-                                si->RemoveFromStringList(Patch::CHEATS_CONFIG_SECTION, Patch::PATCH_ENABLE_CONFIG_KEY, cheat_name.c_str());
-                                Host::AddKeyedOSDMessage("CheatSlot5", fmt::format("Cheat Slot 5 ({}): OFF", cheat_name));
-                        }
-                        else
-                        {
-                                si->AddToStringList(Patch::CHEATS_CONFIG_SECTION, Patch::PATCH_ENABLE_CONFIG_KEY, cheat_name.c_str());
-                                Host::AddKeyedOSDMessage("CheatSlot5", fmt::format("Cheat Slot 5 ({}): ON", cheat_name));
-                        }
-                        si->Save();
-                        VMManager::ReloadPatches(true, true, true, true);
-                });
-        }
-})
-
-DEFINE_HOTKEY("ToggleCheatSlot6", TRANSLATE_NOOP("Hotkeys", "System"), TRANSLATE_NOOP("Hotkeys", "Toggle Cheat Slot 6"), [](s32 pressed) {
-        if (!pressed && VMManager::HasValidVM())
-        {
-                Host::RunOnCPUThread([]() {
-                        SettingsInterface* si = Host::Internal::GetGameSettingsLayer();
-                        if (!si)
-                                return;
-                        const std::string cheat_name = Host::GetStringSettingValue("CheatHotkeys", "CheatToggleSlot6", "");
-                        if (cheat_name.empty())
-                                return;
-                        std::vector<std::string> enabled = si->GetStringList(Patch::CHEATS_CONFIG_SECTION, Patch::PATCH_ENABLE_CONFIG_KEY);
-                        auto it = std::find(enabled.begin(), enabled.end(), cheat_name);
-                        if (it != enabled.end())
-                        {
-                                si->RemoveFromStringList(Patch::CHEATS_CONFIG_SECTION, Patch::PATCH_ENABLE_CONFIG_KEY, cheat_name.c_str());
-                                Host::AddKeyedOSDMessage("CheatSlot6", fmt::format("Cheat Slot 6 ({}): OFF", cheat_name));
-                        }
-                        else
-                        {
-                                si->AddToStringList(Patch::CHEATS_CONFIG_SECTION, Patch::PATCH_ENABLE_CONFIG_KEY, cheat_name.c_str());
-                                Host::AddKeyedOSDMessage("CheatSlot6", fmt::format("Cheat Slot 6 ({}): ON", cheat_name));
-                        }
-                        si->Save();
-                        VMManager::ReloadPatches(true, true, true, true);
-                });
-        }
-})
-
-DEFINE_HOTKEY("ToggleCheatSlot7", TRANSLATE_NOOP("Hotkeys", "System"), TRANSLATE_NOOP("Hotkeys", "Toggle Cheat Slot 7"), [](s32 pressed) {
-        if (!pressed && VMManager::HasValidVM())
-        {
-                Host::RunOnCPUThread([]() {
-                        SettingsInterface* si = Host::Internal::GetGameSettingsLayer();
-                        if (!si)
-                                return;
-                        const std::string cheat_name = Host::GetStringSettingValue("CheatHotkeys", "CheatToggleSlot7", "");
-                        if (cheat_name.empty())
-                                return;
-                        std::vector<std::string> enabled = si->GetStringList(Patch::CHEATS_CONFIG_SECTION, Patch::PATCH_ENABLE_CONFIG_KEY);
-                        auto it = std::find(enabled.begin(), enabled.end(), cheat_name);
-                        if (it != enabled.end())
-                        {
-                                si->RemoveFromStringList(Patch::CHEATS_CONFIG_SECTION, Patch::PATCH_ENABLE_CONFIG_KEY, cheat_name.c_str());
-                                Host::AddKeyedOSDMessage("CheatSlot7", fmt::format("Cheat Slot 7 ({}): OFF", cheat_name));
-                        }
-                        else
-                        {
-                                si->AddToStringList(Patch::CHEATS_CONFIG_SECTION, Patch::PATCH_ENABLE_CONFIG_KEY, cheat_name.c_str());
-                                Host::AddKeyedOSDMessage("CheatSlot7", fmt::format("Cheat Slot 7 ({}): ON", cheat_name));
-                        }
-                        si->Save();
-                        VMManager::ReloadPatches(true, true, true, true);
-                });
-        }
-})
-
-DEFINE_HOTKEY("ToggleCheatSlot8", TRANSLATE_NOOP("Hotkeys", "System"), TRANSLATE_NOOP("Hotkeys", "Toggle Cheat Slot 8"), [](s32 pressed) {
-        if (!pressed && VMManager::HasValidVM())
-        {
-                Host::RunOnCPUThread([]() {
-                        SettingsInterface* si = Host::Internal::GetGameSettingsLayer();
-                        if (!si)
-                                return;
-                        const std::string cheat_name = Host::GetStringSettingValue("CheatHotkeys", "CheatToggleSlot8", "");
-                        if (cheat_name.empty())
-                                return;
-                        std::vector<std::string> enabled = si->GetStringList(Patch::CHEATS_CONFIG_SECTION, Patch::PATCH_ENABLE_CONFIG_KEY);
-                        auto it = std::find(enabled.begin(), enabled.end(), cheat_name);
-                        if (it != enabled.end())
-                        {
-                                si->RemoveFromStringList(Patch::CHEATS_CONFIG_SECTION, Patch::PATCH_ENABLE_CONFIG_KEY, cheat_name.c_str());
-                                Host::AddKeyedOSDMessage("CheatSlot8", fmt::format("Cheat Slot 8 ({}): OFF", cheat_name));
-                        }
-                        else
-                        {
-                                si->AddToStringList(Patch::CHEATS_CONFIG_SECTION, Patch::PATCH_ENABLE_CONFIG_KEY, cheat_name.c_str());
-                                Host::AddKeyedOSDMessage("CheatSlot8", fmt::format("Cheat Slot 8 ({}): ON", cheat_name));
-                        }
-                        si->Save();
-                        VMManager::ReloadPatches(true, true, true, true);
-                });
-        }
-})
-
-DEFINE_HOTKEY("ToggleCheatSlot9", TRANSLATE_NOOP("Hotkeys", "System"), TRANSLATE_NOOP("Hotkeys", "Toggle Cheat Slot 9"), [](s32 pressed) {
-        if (!pressed && VMManager::HasValidVM())
-        {
-                Host::RunOnCPUThread([]() {
-                        SettingsInterface* si = Host::Internal::GetGameSettingsLayer();
-                        if (!si)
-                                return;
-                        const std::string cheat_name = Host::GetStringSettingValue("CheatHotkeys", "CheatToggleSlot9", "");
-                        if (cheat_name.empty())
-                                return;
-                        std::vector<std::string> enabled = si->GetStringList(Patch::CHEATS_CONFIG_SECTION, Patch::PATCH_ENABLE_CONFIG_KEY);
-                        auto it = std::find(enabled.begin(), enabled.end(), cheat_name);
-                        if (it != enabled.end())
-                        {
-                                si->RemoveFromStringList(Patch::CHEATS_CONFIG_SECTION, Patch::PATCH_ENABLE_CONFIG_KEY, cheat_name.c_str());
-                                Host::AddKeyedOSDMessage("CheatSlot9", fmt::format("Cheat Slot 9 ({}): OFF", cheat_name));
-                        }
-                        else
-                        {
-                                si->AddToStringList(Patch::CHEATS_CONFIG_SECTION, Patch::PATCH_ENABLE_CONFIG_KEY, cheat_name.c_str());
-                                Host::AddKeyedOSDMessage("CheatSlot9", fmt::format("Cheat Slot 9 ({}): ON", cheat_name));
-                        }
-                        si->Save();
-                        VMManager::ReloadPatches(true, true, true, true);
-                });
-        }
-})
-
-DEFINE_HOTKEY("ToggleCheatSlot10", TRANSLATE_NOOP("Hotkeys", "System"), TRANSLATE_NOOP("Hotkeys", "Toggle Cheat Slot 10"), [](s32 pressed) {
-        if (!pressed && VMManager::HasValidVM())
-        {
-                Host::RunOnCPUThread([]() {
-                        SettingsInterface* si = Host::Internal::GetGameSettingsLayer();
-                        if (!si)
-                                return;
-                        const std::string cheat_name = Host::GetStringSettingValue("CheatHotkeys", "CheatToggleSlot10", "");
-                        if (cheat_name.empty())
-                                return;
-                        std::vector<std::string> enabled = si->GetStringList(Patch::CHEATS_CONFIG_SECTION, Patch::PATCH_ENABLE_CONFIG_KEY);
-                        auto it = std::find(enabled.begin(), enabled.end(), cheat_name);
-                        if (it != enabled.end())
-                        {
-                                si->RemoveFromStringList(Patch::CHEATS_CONFIG_SECTION, Patch::PATCH_ENABLE_CONFIG_KEY, cheat_name.c_str());
-                                Host::AddKeyedOSDMessage("CheatSlot10", fmt::format("Cheat Slot 10 ({}): OFF", cheat_name));
-                        }
-                        else
-                        {
-                                si->AddToStringList(Patch::CHEATS_CONFIG_SECTION, Patch::PATCH_ENABLE_CONFIG_KEY, cheat_name.c_str());
-                                Host::AddKeyedOSDMessage("CheatSlot10", fmt::format("Cheat Slot 10 ({}): ON", cheat_name));
-                        }
-                        si->Save();
-                        VMManager::ReloadPatches(true, true, true, true);
-                });
-        }
-})
-
-DEFINE_HOTKEY("ToggleCheatSlot11", TRANSLATE_NOOP("Hotkeys", "System"), TRANSLATE_NOOP("Hotkeys", "Toggle Cheat Slot 11"), [](s32 pressed) {
-        if (!pressed && VMManager::HasValidVM())
-        {
-                Host::RunOnCPUThread([]() {
-                        SettingsInterface* si = Host::Internal::GetGameSettingsLayer();
-                        if (!si)
-                                return;
-                        const std::string cheat_name = Host::GetStringSettingValue("CheatHotkeys", "CheatToggleSlot11", "");
-                        if (cheat_name.empty())
-                                return;
-                        std::vector<std::string> enabled = si->GetStringList(Patch::CHEATS_CONFIG_SECTION, Patch::PATCH_ENABLE_CONFIG_KEY);
-                        auto it = std::find(enabled.begin(), enabled.end(), cheat_name);
-                        if (it != enabled.end())
-                        {
-                                si->RemoveFromStringList(Patch::CHEATS_CONFIG_SECTION, Patch::PATCH_ENABLE_CONFIG_KEY, cheat_name.c_str());
-                                Host::AddKeyedOSDMessage("CheatSlot11", fmt::format("Cheat Slot 11 ({}): OFF", cheat_name));
-                        }
-                        else
-                        {
-                                si->AddToStringList(Patch::CHEATS_CONFIG_SECTION, Patch::PATCH_ENABLE_CONFIG_KEY, cheat_name.c_str());
-                                Host::AddKeyedOSDMessage("CheatSlot11", fmt::format("Cheat Slot 11 ({}): ON", cheat_name));
-                        }
-                        si->Save();
-                        VMManager::ReloadPatches(true, true, true, true);
-                });
-        }
-})
-
-DEFINE_HOTKEY("ToggleCheatSlot12", TRANSLATE_NOOP("Hotkeys", "System"), TRANSLATE_NOOP("Hotkeys", "Toggle Cheat Slot 12"), [](s32 pressed) {
-        if (!pressed && VMManager::HasValidVM())
-        {
-                Host::RunOnCPUThread([]() {
-                        SettingsInterface* si = Host::Internal::GetGameSettingsLayer();
-                        if (!si)
-                                return;
-                        const std::string cheat_name = Host::GetStringSettingValue("CheatHotkeys", "CheatToggleSlot12", "");
-                        if (cheat_name.empty())
-                                return;
-                        std::vector<std::string> enabled = si->GetStringList(Patch::CHEATS_CONFIG_SECTION, Patch::PATCH_ENABLE_CONFIG_KEY);
-                        auto it = std::find(enabled.begin(), enabled.end(), cheat_name);
-                        if (it != enabled.end())
-                        {
-                                si->RemoveFromStringList(Patch::CHEATS_CONFIG_SECTION, Patch::PATCH_ENABLE_CONFIG_KEY, cheat_name.c_str());
-                                Host::AddKeyedOSDMessage("CheatSlot12", fmt::format("Cheat Slot 12 ({}): OFF", cheat_name));
-                        }
-                        else
-                        {
-                                si->AddToStringList(Patch::CHEATS_CONFIG_SECTION, Patch::PATCH_ENABLE_CONFIG_KEY, cheat_name.c_str());
-                                Host::AddKeyedOSDMessage("CheatSlot12", fmt::format("Cheat Slot 12 ({}): ON", cheat_name));
-                        }
-                        si->Save();
-                        VMManager::ReloadPatches(true, true, true, true);
-                });
-        }
-})
-
-DEFINE_HOTKEY("ToggleCheatSlot13", TRANSLATE_NOOP("Hotkeys", "System"), TRANSLATE_NOOP("Hotkeys", "Toggle Cheat Slot 13"), [](s32 pressed) {
-        if (!pressed && VMManager::HasValidVM())
-        {
-                Host::RunOnCPUThread([]() {
-                        SettingsInterface* si = Host::Internal::GetGameSettingsLayer();
-                        if (!si)
-                                return;
-                        const std::string cheat_name = Host::GetStringSettingValue("CheatHotkeys", "CheatToggleSlot13", "");
-                        if (cheat_name.empty())
-                                return;
-                        std::vector<std::string> enabled = si->GetStringList(Patch::CHEATS_CONFIG_SECTION, Patch::PATCH_ENABLE_CONFIG_KEY);
-                        auto it = std::find(enabled.begin(), enabled.end(), cheat_name);
-                        if (it != enabled.end())
-                        {
-                                si->RemoveFromStringList(Patch::CHEATS_CONFIG_SECTION, Patch::PATCH_ENABLE_CONFIG_KEY, cheat_name.c_str());
-                                Host::AddKeyedOSDMessage("CheatSlot13", fmt::format("Cheat Slot 13 ({}): OFF", cheat_name));
-                        }
-                        else
-                        {
-                                si->AddToStringList(Patch::CHEATS_CONFIG_SECTION, Patch::PATCH_ENABLE_CONFIG_KEY, cheat_name.c_str());
-                                Host::AddKeyedOSDMessage("CheatSlot13", fmt::format("Cheat Slot 13 ({}): ON", cheat_name));
-                        }
-                        si->Save();
-                        VMManager::ReloadPatches(true, true, true, true);
-                });
-        }
-})
-
-DEFINE_HOTKEY("ToggleCheatSlot14", TRANSLATE_NOOP("Hotkeys", "System"), TRANSLATE_NOOP("Hotkeys", "Toggle Cheat Slot 14"), [](s32 pressed) {
-        if (!pressed && VMManager::HasValidVM())
-        {
-                Host::RunOnCPUThread([]() {
-                        SettingsInterface* si = Host::Internal::GetGameSettingsLayer();
-                        if (!si)
-                                return;
-                        const std::string cheat_name = Host::GetStringSettingValue("CheatHotkeys", "CheatToggleSlot14", "");
-                        if (cheat_name.empty())
-                                return;
-                        std::vector<std::string> enabled = si->GetStringList(Patch::CHEATS_CONFIG_SECTION, Patch::PATCH_ENABLE_CONFIG_KEY);
-                        auto it = std::find(enabled.begin(), enabled.end(), cheat_name);
-                        if (it != enabled.end())
-                        {
-                                si->RemoveFromStringList(Patch::CHEATS_CONFIG_SECTION, Patch::PATCH_ENABLE_CONFIG_KEY, cheat_name.c_str());
-                                Host::AddKeyedOSDMessage("CheatSlot14", fmt::format("Cheat Slot 14 ({}): OFF", cheat_name));
-                        }
-                        else
-                        {
-                                si->AddToStringList(Patch::CHEATS_CONFIG_SECTION, Patch::PATCH_ENABLE_CONFIG_KEY, cheat_name.c_str());
-                                Host::AddKeyedOSDMessage("CheatSlot14", fmt::format("Cheat Slot 14 ({}): ON", cheat_name));
-                        }
-                        si->Save();
-                        VMManager::ReloadPatches(true, true, true, true);
-                });
-        }
-})
-
-DEFINE_HOTKEY("ToggleCheatSlot15", TRANSLATE_NOOP("Hotkeys", "System"), TRANSLATE_NOOP("Hotkeys", "Toggle Cheat Slot 15"), [](s32 pressed) {
-        if (!pressed && VMManager::HasValidVM())
-        {
-                Host::RunOnCPUThread([]() {
-                        SettingsInterface* si = Host::Internal::GetGameSettingsLayer();
-                        if (!si)
-                                return;
-                        const std::string cheat_name = Host::GetStringSettingValue("CheatHotkeys", "CheatToggleSlot15", "");
-                        if (cheat_name.empty())
-                                return;
-                        std::vector<std::string> enabled = si->GetStringList(Patch::CHEATS_CONFIG_SECTION, Patch::PATCH_ENABLE_CONFIG_KEY);
-                        auto it = std::find(enabled.begin(), enabled.end(), cheat_name);
-                        if (it != enabled.end())
-                        {
-                                si->RemoveFromStringList(Patch::CHEATS_CONFIG_SECTION, Patch::PATCH_ENABLE_CONFIG_KEY, cheat_name.c_str());
-                                Host::AddKeyedOSDMessage("CheatSlot15", fmt::format("Cheat Slot 15 ({}): OFF", cheat_name));
-                        }
-                        else
-                        {
-                                si->AddToStringList(Patch::CHEATS_CONFIG_SECTION, Patch::PATCH_ENABLE_CONFIG_KEY, cheat_name.c_str());
-                                Host::AddKeyedOSDMessage("CheatSlot15", fmt::format("Cheat Slot 15 ({}): ON", cheat_name));
-                        }
-                        si->Save();
-                        VMManager::ReloadPatches(true, true, true, true);
-                });
-        }
-})
-
-DEFINE_HOTKEY("ToggleCheatSlot16", TRANSLATE_NOOP("Hotkeys", "System"), TRANSLATE_NOOP("Hotkeys", "Toggle Cheat Slot 16"), [](s32 pressed) {
-        if (!pressed && VMManager::HasValidVM())
-        {
-                Host::RunOnCPUThread([]() {
-                        SettingsInterface* si = Host::Internal::GetGameSettingsLayer();
-                        if (!si)
-                                return;
-                        const std::string cheat_name = Host::GetStringSettingValue("CheatHotkeys", "CheatToggleSlot16", "");
-                        if (cheat_name.empty())
-                                return;
-                        std::vector<std::string> enabled = si->GetStringList(Patch::CHEATS_CONFIG_SECTION, Patch::PATCH_ENABLE_CONFIG_KEY);
-                        auto it = std::find(enabled.begin(), enabled.end(), cheat_name);
-                        if (it != enabled.end())
-                        {
-                                si->RemoveFromStringList(Patch::CHEATS_CONFIG_SECTION, Patch::PATCH_ENABLE_CONFIG_KEY, cheat_name.c_str());
-                                Host::AddKeyedOSDMessage("CheatSlot16", fmt::format("Cheat Slot 16 ({}): OFF", cheat_name));
-                        }
-                        else
-                        {
-                                si->AddToStringList(Patch::CHEATS_CONFIG_SECTION, Patch::PATCH_ENABLE_CONFIG_KEY, cheat_name.c_str());
-                                Host::AddKeyedOSDMessage("CheatSlot16", fmt::format("Cheat Slot 16 ({}): ON", cheat_name));
-                        }
-                        si->Save();
-                        VMManager::ReloadPatches(true, true, true, true);
-                });
-        }
-})
-
+DEFINE_HOTKEY("ToggleCheatSlot1", TRANSLATE_NOOP("Hotkeys", "System"), TRANSLATE_NOOP("Hotkeys", "Toggle Cheat Slot 1"), [](s32 pressed) { if (!pressed) HotkeyToggleCheatSlot(1); })
+DEFINE_HOTKEY("ToggleCheatSlot2", TRANSLATE_NOOP("Hotkeys", "System"), TRANSLATE_NOOP("Hotkeys", "Toggle Cheat Slot 2"), [](s32 pressed) { if (!pressed) HotkeyToggleCheatSlot(2); })
+DEFINE_HOTKEY("ToggleCheatSlot3", TRANSLATE_NOOP("Hotkeys", "System"), TRANSLATE_NOOP("Hotkeys", "Toggle Cheat Slot 3"), [](s32 pressed) { if (!pressed) HotkeyToggleCheatSlot(3); })
+DEFINE_HOTKEY("ToggleCheatSlot4", TRANSLATE_NOOP("Hotkeys", "System"), TRANSLATE_NOOP("Hotkeys", "Toggle Cheat Slot 4"), [](s32 pressed) { if (!pressed) HotkeyToggleCheatSlot(4); })
+DEFINE_HOTKEY("ToggleCheatSlot5", TRANSLATE_NOOP("Hotkeys", "System"), TRANSLATE_NOOP("Hotkeys", "Toggle Cheat Slot 5"), [](s32 pressed) { if (!pressed) HotkeyToggleCheatSlot(5); })
+DEFINE_HOTKEY("ToggleCheatSlot6", TRANSLATE_NOOP("Hotkeys", "System"), TRANSLATE_NOOP("Hotkeys", "Toggle Cheat Slot 6"), [](s32 pressed) { if (!pressed) HotkeyToggleCheatSlot(6); })
+DEFINE_HOTKEY("ToggleCheatSlot7", TRANSLATE_NOOP("Hotkeys", "System"), TRANSLATE_NOOP("Hotkeys", "Toggle Cheat Slot 7"), [](s32 pressed) { if (!pressed) HotkeyToggleCheatSlot(7); })
+DEFINE_HOTKEY("ToggleCheatSlot8", TRANSLATE_NOOP("Hotkeys", "System"), TRANSLATE_NOOP("Hotkeys", "Toggle Cheat Slot 8"), [](s32 pressed) { if (!pressed) HotkeyToggleCheatSlot(8); })
+DEFINE_HOTKEY("ToggleCheatSlot9", TRANSLATE_NOOP("Hotkeys", "System"), TRANSLATE_NOOP("Hotkeys", "Toggle Cheat Slot 9"), [](s32 pressed) { if (!pressed) HotkeyToggleCheatSlot(9); })
+DEFINE_HOTKEY("ToggleCheatSlot10", TRANSLATE_NOOP("Hotkeys", "System"), TRANSLATE_NOOP("Hotkeys", "Toggle Cheat Slot 10"), [](s32 pressed) { if (!pressed) HotkeyToggleCheatSlot(10); })
+DEFINE_HOTKEY("ToggleCheatSlot11", TRANSLATE_NOOP("Hotkeys", "System"), TRANSLATE_NOOP("Hotkeys", "Toggle Cheat Slot 11"), [](s32 pressed) { if (!pressed) HotkeyToggleCheatSlot(11); })
+DEFINE_HOTKEY("ToggleCheatSlot12", TRANSLATE_NOOP("Hotkeys", "System"), TRANSLATE_NOOP("Hotkeys", "Toggle Cheat Slot 12"), [](s32 pressed) { if (!pressed) HotkeyToggleCheatSlot(12); })
+DEFINE_HOTKEY("ToggleCheatSlot13", TRANSLATE_NOOP("Hotkeys", "System"), TRANSLATE_NOOP("Hotkeys", "Toggle Cheat Slot 13"), [](s32 pressed) { if (!pressed) HotkeyToggleCheatSlot(13); })
+DEFINE_HOTKEY("ToggleCheatSlot14", TRANSLATE_NOOP("Hotkeys", "System"), TRANSLATE_NOOP("Hotkeys", "Toggle Cheat Slot 14"), [](s32 pressed) { if (!pressed) HotkeyToggleCheatSlot(14); })
+DEFINE_HOTKEY("ToggleCheatSlot15", TRANSLATE_NOOP("Hotkeys", "System"), TRANSLATE_NOOP("Hotkeys", "Toggle Cheat Slot 15"), [](s32 pressed) { if (!pressed) HotkeyToggleCheatSlot(15); })
+DEFINE_HOTKEY("ToggleCheatSlot16", TRANSLATE_NOOP("Hotkeys", "System"), TRANSLATE_NOOP("Hotkeys", "Toggle Cheat Slot 16"), [](s32 pressed) { if (!pressed) HotkeyToggleCheatSlot(16); })
 END_HOTKEY_LIST()
